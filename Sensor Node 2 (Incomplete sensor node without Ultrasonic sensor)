@@ -1,0 +1,348 @@
+// Created by M le Roux (21662487) to satisfy the requirements of
+// Stellenbosch University Mechatronics Project 488 in 2023.
+// ** Sensor Node 2
+
+// For LoRa Module
+#include <SPI.h>
+#include <LoRa.h> 
+//For Ultrasonic Sensor
+#include <ESP32Time.h>
+#include <RunningMedian.h>
+/*---------------Pin Definitions----------------*/
+// Ultrasonic Sensor
+#define trigPin  25
+#define echoPin  26
+// LoRa Pins
+#define NSS 5
+#define RST 14
+#define DIO0 2
+
+/*---------------Sleep Peripherals--------------*/ 
+#define uS_TO_S_FACTOR 1000000ULL   // Conversion factor for micro seconds to seconds 
+#define TIME_TO_SLEEP  15           // Time ESP32 will go to sleep (in seconds) 60 = 1 min 
+/*---------------RTC Peripherals----------------*/  
+ESP32Time rtc(3600);                // offset in seconds GMT+1 
+
+/*-------------Adjustable Variables--------------*/
+// To set orignal RTC
+int OriginalSeconds = 00;
+int OriginalMinutes = 59;
+int OriginalHour = 19;
+int OriginalDay = 18;
+int OriginalMonth = 10;
+int OriginalYear = 2023;
+
+/*------------------Variables--------------------*/
+// Variables to check when to sample water height 
+RTC_DATA_ATTR int Current = 0;
+RTC_DATA_ATTR int Previous = 0;
+RTC_DATA_ATTR int n = 0;
+
+// LoRa Send 
+int counter = 0;
+int Node_ID = 2;            // Change for each node
+String tsString;
+float WaterLevel;
+
+// Create a new strings to store the isolated substrings
+char sec[3];
+char minn[3];
+char hr[3];
+char dy[3];
+char mnth[3];
+char yr[5];
+char thestring[100];
+
+// LoRa Receive Flag
+volatile bool LoRaReceiveFlag = false;
+
+// Lora Send Flag
+volatile bool LoRaSendFlag = false;
+
+// Flag to indicate RTC Synchronization taking place
+volatile bool RTCFlag = false;
+
+volatile int incomingPacketSize;
+String Message;
+String ACKstring = "";
+int tick = 0;
+
+// For buffer
+int bufferStore = 0;
+String Store[10] = {};
+
+/*---------------Ultrasonic Setup---------------*/ 
+void Ultrasonic();
+RunningMedian samples = RunningMedian(15);
+
+/*-------------------Functions------------------*/
+void sleep();
+void Epoch();
+void Sensor();
+void Ultrasonic();
+void LoRaSend();
+void Seperate();
+
+void setup() {
+  Serial.begin(115200);
+/*-------------------RTC Setup------------------*/ 
+// NB!! TB Dashboard 2 hours ahead so subtract 2 hours 
+// Will display as a hour behind on serial monitor but is nessissary to upload to Thingsboard correctly
+  rtc.setTime(OriginalSeconds, OriginalMinutes, (OriginalHour - 2), OriginalDay,  OriginalMonth, OriginalYear);  
+  Previous = rtc.getHour();            
+
+/*---------------Sleep Mode Setup---------------*/ 
+  esp_sleep_enable_timer_wakeup(TIME_TO_SLEEP * uS_TO_S_FACTOR);
+
+/*----------------Ultrasonic Pins---------------*/ 
+  pinMode(trigPin, OUTPUT);               // Sets the trigPin as an Output 
+  pinMode(echoPin, INPUT_PULLUP);         // Sets the echoPin as an Input 
+
+/*--------------LoRa Module Setup--------------*/ 
+  Serial.println("LoRa Sender");
+  LoRa.setPins(NSS, RST, DIO0);
+  if (!LoRa.begin(433E6)) 
+  {
+    Serial.println("Starting LoRa failed!");
+    while (1);
+  }
+  else if(LoRa.begin(433E6))
+  {
+    Serial.println("Starting LoRa Connected!");
+  }
+
+  //Sync Clock at Startup
+  Message = "Node Startup";
+  LoRaSend();
+/*----------------------------------------------*/   
+}
+
+
+void loop() {
+  Serial.println(rtc.getTime("%A, %B %d %Y %H:%M:%S"));
+  Epoch();
+  
+/*----------Code to sample every hour-----------*/        
+  Current = rtc.getHour();     
+/*----------------------------------------------*/   
+  Sensor();
+
+  // Tp increased to above maximum transmission time for system optimisation and to further
+  // minimise collision
+  int Tp = 5000;      
+  int N = 0;
+  int Nmax = 15;
+  ACKstring = "";
+  Message = (String)"C: " + counter + " WL: " + WaterLevel + " ID: " + Node_ID + " ts: " + tsString;
+  while ((LoRaSendFlag && Message != ACKstring) && (N < Nmax))
+  {
+    ACKstring = "";
+    if(LoRaSendFlag)
+    {
+      LoRaSend();  
+      
+      LoRa.receive(); // Set to Receive Mode 
+      Serial.println("Transmit Done, Receive Mode Enabled"); 
+      
+      tick = millis();
+      while(millis() < (tick + 2*Tp))
+      {
+        if(!LoRaReceiveFlag)
+        {
+          onReceive(LoRa.parsePacket());
+        }
+      } 
+      LoRaReceiveFlag = false;
+    } 
+    N = N + 1;
+    tick = millis();
+    while(millis() < (Tp*random(0, pow(2,N)-1)));
+    if (Message == ACKstring)
+    {
+      Serial.println("Acknoledgement Received");
+      LoRaSendFlag = false;
+    }
+    // store the send attempts
+    if(N == 1)
+    {
+      Store[bufferStore] = Message;
+      bufferStore = bufferStore +1;
+    }
+  }
+
+  // Sending missed packets
+  if (bufferStore == 10)
+  {
+    for(int x = 0; x <= 9; x++)
+    {
+      // allow time for previous packet to send
+      tick = millis();
+      while(millis() < tick + 35000);
+      Message = Store[x];
+      LoRaSend();
+    }
+    bufferStore = 0;
+  }
+
+  // RTC Synchronization
+  LoRa.receive(); // Set to Receive Mode 
+  if(!LoRaReceiveFlag)
+  {
+    RTCFlag = true;
+    onReceive(LoRa.parsePacket());
+    if (LoRaReceiveFlag)
+    {
+      Seperate(); 
+    } 
+  }
+  LoRaReceiveFlag = false;
+  RTCFlag = false;
+  thestring[100] = {};
+      
+/*-----------Code to enter sleep mode-----------*/ 
+  sleep();
+}
+
+
+void sleep()
+{
+  Serial.println("Going to sleep now");
+  Serial.flush(); 
+  esp_light_sleep_start();
+}
+
+/*Converting epoch time to string and adds trailing zeros to obtain length of 13 required for thingsboard*/
+void Epoch()
+{
+  int ts = rtc.getLocalEpoch();
+  tsString = String(ts);
+  while (tsString.length() < 13) 
+  {
+    tsString.concat("0");
+  }
+}
+
+/* Check if its a new hour and Sample waterlevel */
+void Sensor()
+{
+    if ( Current != Previous )
+  {
+    Previous = Current;
+    //Ultrasonic();
+    WaterLevel = random(8, 28);
+
+    counter++;
+    LoRaSendFlag = true;       
+  }
+}
+
+/* Send collected data packet to gateway node */
+void LoRaSend()
+{
+  LoRa.idle();
+  LoRa.beginPacket();
+  LoRa.print(Message);
+  LoRa.endPacket(true); 
+  Serial.println("Message Sent " + Message);
+}
+
+/* Store Received Packet */
+void onReceive(int packetSize) 
+{
+  ACKstring = "";
+  if (packetSize == 0) return;          // if there's no packet, return
+
+  while (LoRa.available()) 
+  {
+    ACKstring += (char)LoRa.read();
+  }
+  
+  Serial.print("Received string '");
+  Serial.println(ACKstring);
+  if (RTCFlag)
+  {
+    if (ACKstring.length() < 40)
+    {
+      return;
+    }
+    else
+    {
+      ACKstring.toCharArray(thestring, ACKstring.length() + 1);
+    }
+  }
+  
+  LoRaReceiveFlag = true;
+}
+
+/* Seperate into time variables and synchronize clock */
+void Seperate()
+{
+  // Find the positions of the markers 
+  int secStart = strstr(thestring, "sec:") - thestring + 4;  // Add 5 to skip "sec: " 
+  int secEnd = strstr(thestring, "min:") - thestring - 1;    // Subtract 1 to exclude the space before "min:" 
+  int minStart = strstr(thestring, "min: ") - thestring + 5;  // Add 5 to skip "min :"
+  int minEnd = strstr(thestring, "hr:") - thestring - 1;    // Subtract 1 to exclude the space before "hr:"
+  int hrStart = strstr(thestring, "hr: ") - thestring + 4;  // Add 4 to skip "hr: "
+  int hrEnd = strstr(thestring, "yr:") - thestring - 1;    // Subtract 1 to exclude the space before "yr:"
+  int yrStart = strstr(thestring, "yr: ") - thestring + 4;  // Add 4 to skip "yr: "
+  int yrEnd = strstr(thestring, "mnth:") - thestring - 1;    // Subtract 1 to exclude the space before "mnth:"
+  int mnthStart = strstr(thestring, "mnth: ") - thestring + 6;  // Add 6 to skip "mnth: "
+  int mnthEnd = strstr(thestring, "dy:") - thestring - 1;    // Subtract 1 to exclude the space before "dy:"
+  int dyStart = strstr(thestring, "dy: ") - thestring + 4;  // Add 4 to skip "dy: "
+ 
+  // Copy the desired substring to the new strings
+  strncpy(sec, thestring + secStart, secEnd - secStart);
+  sec[secEnd - secStart] = '\0';  // Null-terminate the new string
+
+  strncpy(minn, thestring + minStart, minEnd - minStart);
+  minn[minEnd - minStart] = '\0';  // Null-terminate the new string
+
+  strncpy(hr, thestring + hrStart, hrEnd - hrStart);
+  hr[hrEnd - hrStart] = '\0';  // Null-terminate the new string
+
+  strncpy(yr, thestring + yrStart, yrEnd - yrStart);
+  yr[yrEnd - yrStart] = '\0';  // Null-terminate the new string
+
+  strncpy(mnth, thestring + mnthStart, mnthEnd - mnthStart);
+  mnth[mnthEnd - mnthStart] = '\0';  // Null-terminate the new string
+
+  strncpy(dy, thestring + dyStart, 2);
+  dy[2] = '\0';
+
+  rtc.setTime(atoi(sec), atoi(minn), atoi(hr) - 2, atoi(dy), atoi(mnth), atoi(yr));
+  Previous = rtc.getHour();            
+}
+
+void Ultrasonic()
+{
+  for (int i=0; i<5; i++)
+  {
+    // Sets the trigPin on HIGH state for 10 micro seconds
+    digitalWrite(trigPin, LOW);
+    delayMicroseconds(2);
+    
+    digitalWrite(trigPin, HIGH);
+    delayMicroseconds(10);
+    digitalWrite(trigPin, LOW);
+    float duration = pulseIn(echoPin, HIGH); 
+    float distance = (duration/58) ;    
+    
+    if(distance>=15 && distance<450)
+    {
+      samples.add(distance);
+    }
+    tick = millis();
+    while(millis() < tick + 4000);
+  }
+    float Median = (samples.getMedian());
+    float a1 = 0.0001;
+    float a2 = -0.0161;
+    float a3 = 1.8284;
+    float b = -13.452;
+
+    // The Ultrasonic sensor is mounted 43 cm above the bottom of the concept 
+    // demonstrator water storage tank. NB!! must be changed if set-up is changed
+    WaterLevel = (43- (a1*pow(Median,3) + a2*pow(Median,2) + a3*Median + b));
+    Serial.print(WaterLevel);
+    Serial.println(" CM");
+}
