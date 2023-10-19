@@ -1,0 +1,394 @@
+// Created by M le Roux (21662487) to satisfy the requirements of
+// Stellenbosch University Mechatronics Project 488 in 2023.
+// ** Gateway Node 
+
+// For LoRa Module
+#include <SPI.h>
+#include <LoRa.h>
+// for Wi-Fi and Thingsboard
+#include <WiFi.h>
+#include <ThingsBoard.h>
+#include <ArduinoJson.h>
+// for RTC syncing
+#include "time.h"
+/*---------------Pin Definitions----------------*/
+#define NSS 5
+#define RST 14
+#define DIO0 2
+
+/*---------------Sleep Peripherals--------------*/ 
+#define uS_TO_S_FACTOR 1000000ULL  // Conversion factor for micro seconds to seconds 
+#define TIME_TO_SLEEP  15         // Time ESP32 will go to sleep (in seconds) 
+
+/*-------------------Functions------------------*/
+void sleep();
+void readMessage();
+void print_wakeup_reason();
+void LoRaSend();
+void Seperate();
+void SendDataToThingsboard();
+void setRTCwithNTP();
+void LoRaSendSyncRTC();
+
+/*-------------Adjustable Variables--------------*/
+// Variables on when to sync RTC
+int SynceHour = 22;
+int SyneMinute = 40;
+/*------------------Variables--------------------*/
+// LoRa Receive Flag
+volatile bool LoRaReceiveFlag = false;
+// RTC Flag - triggers when the received message is to sync the RTC
+volatile bool RTCflag = false;
+
+//Variables to isolate data from received LoRa message
+float WLValueFloat;
+String tsString;
+String IDString;
+char thestring[100];
+char sendstring[100];
+
+// Create a new strings to store the isolated substrings
+char WLValue[10];
+char tsChar[13];
+char IDChar[1];
+
+//For sterilizing JSON
+volatile int incomingPacketSize;
+char payload[200];
+
+// NTP sync
+int second;
+int minute;
+int hour;
+int year;
+int month;
+int day;
+struct tm timeinfo;
+struct tm timeCheck;
+struct tm timePrint;
+char SyncString[] = "Node Startup";
+
+// Variable used for millis() "delay"
+int tick = 0;
+/*------------------NTP Config------------------*/
+constexpr char ntpServer[] = "pool.ntp.org";
+const long  gmtOffset_sec = 0;
+const int   daylightOffset_sec = (2 * 60 * 60); //South Africa = UTC+1
+
+/*-----------------Wi-Fi Config-----------------*/
+// Thingsboard and wifi parameters
+constexpr char WIFI_SSID[] = "HUAWEI-B315-F82F" ;          //"Do_Hugo [2Ghz]";
+constexpr char WIFI_PASSWORD[] = "YTDQ758Y526";           //"leroux04";
+constexpr char TOKEN[] = "r1qPv7sXFD3iYyPfHPYC"; 
+constexpr char THINGSBOARD_SERVER[] = "demo.thingsboard.io";
+
+// MQTT communicate port used - 1883 is the default unencrypted MQTT port.
+constexpr uint16_t THINGSBOARD_PORT = 1883U;
+
+//Maximum packet size that will be sent - if messages are not sent correctly this must be increased.
+constexpr uint32_t MAX_MESSAGE_SIZE = 256U;
+
+// Serial debugging baud rate.
+constexpr uint32_t SERIAL_DEBUG_BAUD = 115200U;
+
+// Initialize wifi and thingsboard
+WiFiClient wifiClient;
+ThingsBoard tb(wifiClient, MAX_MESSAGE_SIZE);
+
+// Statuses for subscribing to rpc
+bool subscribed = false;
+
+// Telementry parameters
+constexpr int16_t telemetrySendInterval = 2000U;
+uint32_t previousDataSend;
+
+// Initalizing WiFi connection - will continuously repeat/delay until connected
+
+void InitWiFi()
+{
+  unsigned long currentMillisWiFi = 0;
+  unsigned long previousMillisWiFi = 0;
+  Serial.println("Connecting to AP ...");
+  // Attempting to establish a connection to the given WiFi network
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  while (WiFi.status() != WL_CONNECTED)
+  {
+    currentMillisWiFi = millis();
+    // Delay 100ms until a connection has been succesfully established
+    tick = millis();
+    while(millis() < (tick + 100));
+    Serial.print(".");
+    // If the module struggles to connect to the internet restart the 
+    // module to avoid enless loop
+    if(currentMillisWiFi - previousMillisWiFi >=150000)
+    {
+      Serial.println("Rebooting to connect to WiFi...");
+      ESP.restart();
+    } 
+    Serial.println(previousMillisWiFi);
+    Serial.println(currentMillisWiFi);
+  }
+  Serial.println("Connected to AP");
+}
+
+// If the wifi has been disconnected - InitWiFi is used to reconnect - returns true if connected successfully
+const bool reconnect()
+{
+  // Check to ensure connection
+  const wl_status_t status = WiFi.status();
+  if (status == WL_CONNECTED)
+  {
+    return true;
+  }
+
+  // If a new connection cannot be establish to the given WiFi network
+  InitWiFi();
+  return true;
+}
+
+void setup() {
+  Serial.begin(115200);
+  InitWiFi();
+  
+  /*------------------LoRa Setup------------------*/
+  LoRa.setPins(NSS, RST, DIO0);
+  if (!LoRa.begin(433E6)) 
+  {
+    Serial.println("Starting LoRa failed!");
+    while (1);
+  }
+  else if(LoRa.begin(433E6))
+  {
+    Serial.println("Starting LoRa Connected!");
+  }
+
+/*---------------Sleep Mode Setup---------------*/ 
+  //esp_sleep_enable_timer_wakeup(TIME_TO_SLEEP * uS_TO_S_FACTOR);
+
+  pinMode(GPIO_NUM_2, INPUT_PULLUP); // GPIO 2 corrosponds to DIO0 on LoRa
+  digitalPinToInterrupt(GPIO_NUM_2); // GPIO 2 corrosponds to DIO0 on LoRa
+  esp_sleep_enable_ext0_wakeup(GPIO_NUM_2, RISING);
+
+  LoRa.onReceive(onMessageReceive); // receive callback for when message is recieving
+  LoRa.onTxDone(onTransmitDone);
+  LoRa.receive();                   // enabling radio receive mode
+  setRTCwithNTP();
+}
+
+
+void loop() {
+
+  getLocalTime(&timePrint);
+  Serial.println(&timePrint, "%A, %B %d %Y %H:%M:%S");
+
+  print_wakeup_reason();     // Can be removed at later stage if there are memory issues - prints reason for wakeup 
+  if (LoRaReceiveFlag) {
+    readMessage();           // Record LoRa Message and processing 
+    LoRaReceiveFlag = false; // Set flag back to false -- next read will only happen after next ext0 event 
+  }
+  // RTC Synchronization
+  getLocalTime(&timeCheck);
+  if((timeCheck.tm_hour == SynceHour && timeCheck.tm_min == SyneMinute) || RTCflag)
+  {
+    setRTCwithNTP();
+  }
+  RTCflag = false; 
+/*-----------Code to enter sleep mode-----------*/ 
+  esp_sleep_enable_ext0_wakeup(GPIO_NUM_2, RISING);
+  esp_sleep_enable_timer_wakeup(TIME_TO_SLEEP * uS_TO_S_FACTOR);
+  sleep();
+/*----------------------------------------------*/ 
+}
+
+void sleep()
+{
+  Serial.println("Going to sleep now");
+  Serial.flush(); 
+  esp_light_sleep_start();
+}
+
+/* Sets LoRaReceiveFlag to enter loop and records packetsize */
+void onMessageReceive(int packetSize) 
+{
+  Serial.println("Interrupt Called");
+  LoRaReceiveFlag = true;
+  incomingPacketSize = packetSize;
+}
+
+/* Record LoRa Message and processing */
+void readMessage() {
+  // Print received packet
+  Serial.print("Received packet '");
+
+  for (int i = 0; i < incomingPacketSize; i++) // Save received packet to a string 
+  {
+    thestring[i] = LoRa.read();
+  }
+  thestring[incomingPacketSize] = '\0';
+  LoRa.idle();
+  Serial.println(thestring);
+
+  if(strcmp(thestring, SyncString) == 0)
+  {
+    RTCflag = true;
+    return;
+  }
+  else
+  {
+    // ALOHA acknoledgement
+    LoRaSend();
+
+    Seperate();                                 // Proccess received packet -- needed for Thingsboard message 
+    SendDataToThingsboard();                    // Connect to thingsboard and send data 
+    tick = millis();
+    while(millis() < (tick + 1000));
+  }
+}
+
+void print_wakeup_reason()
+{
+  esp_sleep_wakeup_cause_t wakeup_reason;
+  wakeup_reason = esp_sleep_get_wakeup_cause();
+  switch(wakeup_reason)
+  {
+    case ESP_SLEEP_WAKEUP_EXT0 : Serial.println("Wakeup caused by external signal using RTC_IO") ; break;
+    case ESP_SLEEP_WAKEUP_TIMER : Serial.println("Wakeup caused by timer"); break;
+    default : Serial.printf("Wakeup was not caused by deep sleep: %d\n",wakeup_reason); break;
+  }
+}
+
+/* Send Acknoledgement message to node */
+void LoRaSend()
+{
+  LoRa.idle();   // Set to standby mode
+  String Message = (String)thestring;
+  LoRa.beginPacket();
+  LoRa.print(Message);
+  LoRa.endPacket(true); 
+  Serial.println("Acknoledgement Sent");
+}
+
+/* Change from idle to receive mode */
+void onTransmitDone() {
+  Serial.println("Transmit Done, Receive Mode Enabled");
+  LoRa.receive(); // Set to Receive Mode
+}
+
+/* Upload Collected data to Thingsboard */
+void SendDataToThingsboard()
+{
+  
+  /* Creating the JSon document with the WaterLever Readings */
+  StaticJsonDocument<200> doc;
+  doc["ts"] = tsString;
+  doc["values"][(String)"WaterLevel" + IDString] = WLValueFloat;
+
+  /* serializeJson */
+  size_t payloadSize = measureJson(doc) + 1;
+  serializeJson(doc, payload, payloadSize);
+
+ 
+  // Delay important as the Wi-Fi module doesn't immediately
+  // to wake after sleep
+  tick = millis();
+  while(millis() < (tick + 5500)); 
+  /*if (!reconnect())
+  {
+    subscribed = false;
+    return;
+  }*/
+  reconnect();
+  
+  /* Make connection */
+  tb.connect(THINGSBOARD_SERVER, TOKEN, THINGSBOARD_PORT);  
+
+  if (!tb.connected())
+  {
+    subscribed = false;
+    // Connect to the ThingsBoard
+    while (!tb.connect(THINGSBOARD_SERVER, TOKEN, THINGSBOARD_PORT))
+    {
+      Serial.println("Failed to connect...reconnecting");
+      tb.connect(THINGSBOARD_SERVER, TOKEN, THINGSBOARD_PORT);
+    }
+  }
+  if (tb.connected())
+  {
+    Serial.print("Connecting to: ");
+    Serial.print(THINGSBOARD_SERVER);
+    Serial.print(" with token ");
+    Serial.println(TOKEN);
+    Serial.println("Connected Successfully!");
+  }
+  
+  //  Sending telemetry every telemetrySendInterval time 
+  if (millis() - previousDataSend > telemetrySendInterval)
+  {
+    previousDataSend = millis();
+    tb.sendTelemetryJson(doc, payloadSize);
+  }
+
+  tb.loop();
+  //  Delay to ensure packet sent 
+  tick = millis();
+  while(millis() < (tick + 5000));
+}
+
+/* Proccess received packet -- needed for Thingsboard message */
+void Seperate()
+{
+  // Find the positions of the markers 
+  int WLstart = strstr(thestring, "WL:") - thestring + 4;  // Add 4 to skip "WL1:" 
+  int WLend = strstr(thestring, "ID:") - thestring - 1;    // Subtract 1 to exclude the space before "ID:" 
+  int TS = strstr(thestring, "ts:") - thestring + 4;       // Add 4 to skip "TS: " 
+  int IDstart = strstr(thestring, "ID:") - thestring + 4;  // Add 4 to skip "ID: " 
+  int IDend = strstr(thestring, "ts:") - thestring - 1;    // Subtract 1 to exclude the space before "ts:" 
+
+  // Copy the desired substring to the new strings 
+  strncpy(IDChar, thestring + IDstart, IDend - IDstart);
+  IDChar[IDend - IDstart] = '\0';  // Null-terminate the new string
+  IDString = String(IDChar);
+
+  strncpy(WLValue, thestring + WLstart, WLend - WLstart);
+  WLValue[WLend - WLstart] = '\0';  // Null-terminate the new string
+  WLValueFloat = atof(WLValue);
+
+  strncpy(tsChar, thestring + TS, 13);
+  tsChar[13] = '\0';
+  tsString = String(tsChar);
+}
+
+/* Save RTC information into structure and save into variables 
+   for synchronization of RTC accross nodes*/
+void setRTCwithNTP()
+{
+  
+  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+  
+  //struct tm timeinfo;
+  if(!getLocalTime(&timeinfo))
+  {
+    
+    Serial.println("Failed to obtain time");
+    return;
+  }
+  second = timeinfo.tm_sec;
+  minute = timeinfo.tm_min;
+  hour = timeinfo.tm_hour;
+  year = timeinfo.tm_year + 1900;
+  month = timeinfo.tm_mon + 1;
+  day = timeinfo.tm_mday;
+  // Send RTC information to Nodes for Synchronization
+  LoRaSendSyncRTC();
+  
+}
+/* Send RTC information to Nodes for Synchronization */
+void LoRaSendSyncRTC()
+{
+  LoRa.idle();   // Set to standby mode
+  String MessageRTC = (String)"sec: " + second + " min: " + minute + " hr: " + hour + " yr: " + year + " mnth: " + month + " dy: " + day;
+  LoRa.beginPacket();
+  LoRa.print(MessageRTC);
+  LoRa.endPacket(true); 
+  Serial.println("Sent");
+}
